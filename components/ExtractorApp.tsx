@@ -347,44 +347,43 @@ export default function ExtractorApp() {
         )}
 
         {/* ── Results ── */}
-        {result && markdown && (
+        {result && (
           <div className="fade-in">
             {/* Stats bar */}
             <div style={{
               display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+              gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
               gap: 12,
               marginBottom: 20,
             }}>
-              {[
-                { label: "Annotations", value: result.annotations.length },
-                { label: "Pages", value: result.totalPages },
-                {
-                  label: "Ink (Handwritten)",
-                  value: result.annotations.filter((a) => a.type.includes("Ink")).length,
-                },
-                {
-                  label: result.usedVisualDetection ? "Detection" : "Notes & Comments",
-                  value: result.usedVisualDetection
-                    ? "Visual"
-                    : result.annotations.filter(
-                        (a) => a.type.includes("Sticky") || a.type.includes("FreeText")
-                      ).length,
-                },
-              ].map((stat) => (
+              {(() => {
+                const hasVisual = result.usedVisualDetection;
+                const textCount = result.annotations.filter((a) => a.shape === "text" || a.type.includes("Handwritten")).length;
+                const markCount = result.annotations.filter((a) => a.shape === "mark").length;
+                const shapeCount = result.annotations.filter((a) => a.shape === "circle" || a.shape === "line").length;
+                const pagesWithAnnotations = new Set(result.annotations.map((a) => a.pageNumber)).size;
+
+                return [
+                  { label: "Total Annotations", value: result.annotations.length },
+                  { label: "Pages with Marks", value: `${pagesWithAnnotations} / ${result.totalPages}` },
+                  { label: "Text Notes", value: textCount },
+                  { label: "Marks & Shapes", value: markCount + shapeCount },
+                  ...(hasVisual ? [{ label: "Detection", value: "Visual" }] : []),
+                ];
+              })().map((stat) => (
                 <div
                   key={stat.label}
                   style={{
-                    padding: "16px 18px",
+                    padding: "14px 16px",
                     background: "var(--bg-card)",
                     border: "1px solid var(--border)",
                     borderRadius: 12,
                   }}
                 >
-                  <div style={{ fontSize: 24, fontWeight: 700, color: "var(--text)" }}>
+                  <div style={{ fontSize: 22, fontWeight: 700, color: "var(--text)" }}>
                     {stat.value}
                   </div>
-                  <div style={{ fontSize: 12, color: "var(--text-dim)", marginTop: 2 }}>
+                  <div style={{ fontSize: 11, color: "var(--text-dim)", marginTop: 2 }}>
                     {stat.label}
                   </div>
                 </div>
@@ -392,7 +391,7 @@ export default function ExtractorApp() {
             </div>
 
             {/* Action buttons */}
-            <div style={{ display: "flex", gap: 10, marginBottom: 20 }}>
+            <div style={{ display: "flex", gap: 10, marginBottom: 20, flexWrap: "wrap" }}>
               <button
                 onClick={handleDownload}
                 style={{
@@ -447,25 +446,163 @@ export default function ExtractorApp() {
               </button>
             </div>
 
-            {/* Markdown Preview */}
-            <div style={{
+            {/* ── Visual Annotation Cards (grouped by page) ── */}
+            {result.usedVisualDetection && (() => {
+              const pages: Record<number, typeof result.annotations> = {};
+              result.annotations.forEach((a) => {
+                (pages[a.pageNumber] = pages[a.pageNumber] || []).push(a);
+              });
+
+              return Object.keys(pages)
+                .map(Number)
+                .sort((a, b) => a - b)
+                .map((pageNum) => (
+                  <div key={pageNum} style={{ marginBottom: 24 }}>
+                    <h3 style={{
+                      fontSize: 14,
+                      fontWeight: 700,
+                      color: "var(--text)",
+                      marginBottom: 10,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                    }}>
+                      <span style={{
+                        background: "var(--accent)",
+                        color: "#fff",
+                        borderRadius: 6,
+                        padding: "2px 8px",
+                        fontSize: 12,
+                      }}>
+                        Page {pageNum}
+                      </span>
+                      <span style={{ color: "var(--text-dim)", fontWeight: 400, fontSize: 12 }}>
+                        {pages[pageNum].length} annotation{pages[pageNum].length !== 1 ? "s" : ""}
+                      </span>
+                    </h3>
+
+                    <div style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
+                      gap: 12,
+                    }}>
+                      {pages[pageNum].map((ann, idx) => {
+                        const colorDot = ann.color || "#888";
+                        return (
+                          <div
+                            key={idx}
+                            style={{
+                              background: "var(--bg-card)",
+                              border: "1px solid var(--border)",
+                              borderRadius: 12,
+                              overflow: "hidden",
+                              borderLeft: `3px solid ${colorDot}`,
+                            }}
+                          >
+                            {/* Image crop */}
+                            {ann.imageDataUrl && (
+                              <div style={{
+                                background: "#111",
+                                padding: 8,
+                                display: "flex",
+                                justifyContent: "center",
+                                maxHeight: 180,
+                                overflow: "hidden",
+                              }}>
+                                <img
+                                  src={ann.imageDataUrl}
+                                  alt={`Annotation on page ${pageNum}`}
+                                  style={{
+                                    maxWidth: "100%",
+                                    maxHeight: 164,
+                                    objectFit: "contain",
+                                    borderRadius: 4,
+                                  }}
+                                />
+                              </div>
+                            )}
+
+                            {/* Info section */}
+                            <div style={{ padding: "10px 14px" }}>
+                              <div style={{
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "space-between",
+                                marginBottom: ann.ocrText ? 8 : 0,
+                              }}>
+                                <span style={{
+                                  fontSize: 11,
+                                  fontWeight: 600,
+                                  color: "var(--text-dim)",
+                                  textTransform: "uppercase",
+                                  letterSpacing: "0.04em",
+                                }}>
+                                  {ann.type}
+                                </span>
+                                {ann.confidence > 0 && (
+                                  <span style={{
+                                    fontSize: 10,
+                                    color: ann.confidence > 0.5 ? "var(--green)" : "var(--text-muted)",
+                                  }}>
+                                    {Math.round(ann.confidence * 100)}% conf
+                                  </span>
+                                )}
+                              </div>
+
+                              {ann.ocrText && (
+                                <p style={{
+                                  fontSize: 13,
+                                  color: "var(--text)",
+                                  lineHeight: 1.5,
+                                  fontStyle: "italic",
+                                  margin: 0,
+                                  whiteSpace: "pre-wrap",
+                                  wordBreak: "break-word",
+                                }}>
+                                  &ldquo;{ann.ocrText}&rdquo;
+                                </p>
+                              )}
+
+                              {ann.content && (
+                                <p style={{
+                                  fontSize: 13,
+                                  color: "var(--text)",
+                                  lineHeight: 1.5,
+                                  margin: 0,
+                                }}>
+                                  {ann.content}
+                                </p>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ));
+            })()}
+
+            {/* ── Markdown Preview (collapsible) ── */}
+            <details style={{
               background: "var(--bg-card)",
               border: "1px solid var(--border)",
               borderRadius: 12,
               overflow: "hidden",
+              marginTop: result.usedVisualDetection ? 8 : 0,
             }}>
-              <div style={{
-                padding: "10px 18px",
-                borderBottom: "1px solid var(--border)",
+              <summary style={{
+                padding: "12px 18px",
+                cursor: "pointer",
                 display: "flex",
                 alignItems: "center",
                 gap: 8,
                 fontSize: 13,
                 color: "var(--text-dim)",
+                userSelect: "none",
               }}>
                 <FileIcon />
-                {file?.name.replace(".pdf", "")}_annotations.md
-              </div>
+                {result.usedVisualDetection ? "Raw Markdown Output" : `${file?.name.replace(".pdf", "")}_annotations.md`}
+              </summary>
               <pre style={{
                 padding: "20px",
                 fontSize: 13,
@@ -476,10 +613,11 @@ export default function ExtractorApp() {
                 maxHeight: 600,
                 whiteSpace: "pre-wrap",
                 wordWrap: "break-word",
+                borderTop: "1px solid var(--border)",
               }}>
                 {markdown}
               </pre>
-            </div>
+            </details>
           </div>
         )}
 

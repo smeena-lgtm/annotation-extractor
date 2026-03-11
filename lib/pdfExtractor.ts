@@ -6,6 +6,9 @@
  *   2. Visual (fallback): detects flattened/embedded ink strokes via content-stream
  *      analysis — handles PDFs where annotations were burned into page content
  *      (common with iPad apps, GoodNotes, PDF Expert exports, etc.)
+ *
+ * Visual mode produces cropped images of each annotation region alongside
+ * best-effort OCR for text-like regions.
  */
 
 import * as pdfjsLib from "pdfjs-dist";
@@ -22,6 +25,10 @@ export interface Annotation {
   ocrText: string;
   confidence: number;
   rect: number[] | null;
+  /** Base-64 data URL of the cropped annotation region (visual mode) */
+  imageDataUrl: string;
+  /** Classification: "text", "mark", "circle", "line" */
+  shape: string;
 }
 
 export interface ExtractionResult {
@@ -92,38 +99,46 @@ function classifyAnnotationColor(
   g: number,
   b: number
 ): ColorClass | null {
-  // Red ink: strong red channel, weak green & blue
   if (r > 160 && g < 90 && b < 90 && r - Math.max(g, b) > 70)
     return { name: "red", hex: rgb255ToHex(r, g, b) };
 
-  // Green ink: strong green, weak red & blue (exclude teal/cyan)
   if (g > 120 && r < 100 && b < 110 && g - Math.max(r, b) > 40)
     return { name: "green", hex: rgb255ToHex(r, g, b) };
 
-  // Blue ink: strong blue, weak red, moderate-low green (exclude cyan where G is high)
   if (b > 150 && r < 100 && g < 120 && b - r > 70)
     return { name: "blue", hex: rgb255ToHex(r, g, b) };
 
-  // Orange ink
   if (r > 180 && g > 80 && g < 170 && b < 70 && r - b > 120)
     return { name: "orange", hex: rgb255ToHex(r, g, b) };
 
-  // Magenta / pink ink
   if (r > 160 && b > 100 && g < 80 && r + b - g * 2 > 200)
     return { name: "magenta", hex: rgb255ToHex(r, g, b) };
 
   return null;
 }
 
-/** Check if a pixel (0-255) matches an annotation color name */
-function pixelMatchesColor(
-  r: number,
-  g: number,
-  b: number,
-  colorName: string
-): boolean {
-  const cls = classifyAnnotationColor(r, g, b);
-  return cls !== null && cls.name === colorName;
+// ─── Shape classification ───────────────────────────────────
+
+function classifyShape(
+  cluster: AnnotationCluster
+): "text" | "mark" | "circle" | "line" {
+  const w = cluster.maxX - cluster.minX;
+  const h = cluster.maxY - cluster.minY;
+  const aspect = w / Math.max(h, 1);
+  const area = w * h;
+
+  // Very small = mark (checkmark, tick, dot)
+  if (area < 3000 && cluster.strokeCount < 6) return "mark";
+
+  // Roughly square with moderate strokes = circle/shape
+  if (aspect > 0.6 && aspect < 1.6 && cluster.strokeCount < 8 && area < 15000)
+    return "circle";
+
+  // Very narrow = line/arrow
+  if (aspect > 6 || aspect < 0.15) return "line";
+
+  // Everything else = text (wide enough, enough strokes)
+  return "text";
 }
 
 // ─── Stroke clustering ─────────────────────────────────────
@@ -148,15 +163,14 @@ interface AnnotationCluster {
 
 /**
  * Merge nearby strokes of the same color into clusters.
- * Uses iterative overlap merging with configurable padding.
+ * Larger padding = more aggressive merging (fewer, bigger regions).
  */
 function clusterStrokes(
   strokes: StrokeBounds[],
-  padding: number = 15
+  padding: number = 20
 ): AnnotationCluster[] {
   if (strokes.length === 0) return [];
 
-  // Start each stroke as its own padded cluster
   let clusters: AnnotationCluster[] = strokes.map((s) => ({
     minX: s.minX - padding,
     minY: s.minY - padding,
@@ -167,7 +181,6 @@ function clusterStrokes(
     strokeCount: 1,
   }));
 
-  // Iteratively merge overlapping same-color clusters
   let merged = true;
   while (merged) {
     merged = false;
@@ -182,7 +195,6 @@ function clusterStrokes(
         if (used.has(j)) continue;
         if (clusters[j].colorName !== cur.colorName) continue;
 
-        // Check bounding-box overlap
         if (
           cur.minX <= clusters[j].maxX &&
           cur.maxX >= clusters[j].minX &&
@@ -205,19 +217,126 @@ function clusterStrokes(
     clusters = next;
   }
 
-  // Filter tiny clusters (likely noise — fewer than 3 strokes and tiny area)
+  // Filter noise: require at least 2 strokes OR meaningful area
   return clusters.filter((c) => {
     const area = (c.maxX - c.minX) * (c.maxY - c.minY);
-    return c.strokeCount >= 3 || area > 200;
+    return c.strokeCount >= 2 || area > 400;
   });
 }
 
-// ─── Render + OCR helpers ───────────────────────────────────
+// ─── Render helpers ─────────────────────────────────────────
 
 /**
- * Render a rectangular region of a PDF page to a canvas.
- * rect = [x0, y0, x1, y1] in PDF coordinate space (origin bottom-left).
+ * Render the full page once, return the canvas for reuse across multiple crops.
  */
+async function renderFullPage(
+  page: any,
+  scale: number
+): Promise<HTMLCanvasElement> {
+  const viewport = page.getViewport({ scale });
+  const canvas = document.createElement("canvas");
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  const ctx = canvas.getContext("2d")!;
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  return canvas;
+}
+
+/**
+ * Crop a region from a pre-rendered page canvas.
+ * Cluster bounds are in PDF coords (origin bottom-left).
+ */
+function cropRegion(
+  fullCanvas: HTMLCanvasElement,
+  cluster: AnnotationCluster,
+  pageHeightPdf: number,
+  scale: number,
+  extraPad: number = 12
+): HTMLCanvasElement | null {
+  const pad = extraPad * scale;
+  const canvasLeft = Math.max(0, cluster.minX * scale - pad);
+  const canvasTop = Math.max(
+    0,
+    (pageHeightPdf - cluster.maxY) * scale - pad
+  );
+  const width = (cluster.maxX - cluster.minX) * scale + pad * 2;
+  const height = (cluster.maxY - cluster.minY) * scale + pad * 2;
+
+  if (width < 8 || height < 8) return null;
+
+  const cropW = Math.min(Math.ceil(width), fullCanvas.width - canvasLeft);
+  const cropH = Math.min(Math.ceil(height), fullCanvas.height - canvasTop);
+  if (cropW < 4 || cropH < 4) return null;
+
+  const cropCanvas = document.createElement("canvas");
+  cropCanvas.width = cropW;
+  cropCanvas.height = cropH;
+  const ctx = cropCanvas.getContext("2d")!;
+
+  ctx.drawImage(
+    fullCanvas,
+    canvasLeft,
+    canvasTop,
+    cropW,
+    cropH,
+    0,
+    0,
+    cropW,
+    cropH
+  );
+
+  return cropCanvas;
+}
+
+/**
+ * Preprocess a cropped region for OCR:
+ * extract annotation-colored pixels as dark text on white background.
+ */
+function preprocessForOCR(
+  canvas: HTMLCanvasElement,
+  colorName: string
+): HTMLCanvasElement {
+  const ocrCanvas = document.createElement("canvas");
+  ocrCanvas.width = canvas.width;
+  ocrCanvas.height = canvas.height;
+  const ctx = ocrCanvas.getContext("2d")!;
+
+  ctx.drawImage(canvas, 0, 0);
+  const imageData = ctx.getImageData(0, 0, ocrCanvas.width, ocrCanvas.height);
+  const { data } = imageData;
+
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i],
+      g = data[i + 1],
+      b = data[i + 2];
+    const cls = classifyAnnotationColor(r, g, b);
+
+    if (cls && cls.name === colorName) {
+      // Annotation pixel → dark
+      data[i] = 30;
+      data[i + 1] = 30;
+      data[i + 2] = 30;
+      data[i + 3] = 255;
+    } else {
+      // Background → white
+      data[i] = 255;
+      data[i + 1] = 255;
+      data[i + 2] = 255;
+      data[i + 3] = 255;
+    }
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+  return ocrCanvas;
+}
+
+/** Convert canvas to PNG data URL */
+function canvasToDataUrl(canvas: HTMLCanvasElement): string {
+  return canvas.toDataURL("image/png");
+}
+
+// ─── Render a region of a PDF page (for standard annotations) ──
+
 async function renderPageRegion(
   page: any,
   rect: number[],
@@ -226,11 +345,9 @@ async function renderPageRegion(
   try {
     const viewport = page.getViewport({ scale });
     const [x0, y0, x1, y1] = rect;
-
-    const padding = 10 * scale;
     const pageHeight = page.getViewport({ scale: 1 }).height;
 
-    // Convert PDF coords (bottom-up) to canvas coords (top-down)
+    const padding = 10 * scale;
     const canvasLeft = x0 * scale - padding;
     const canvasTop = (pageHeight - y1) * scale - padding;
     const width = (x1 - x0) * scale + padding * 2;
@@ -238,20 +355,17 @@ async function renderPageRegion(
 
     if (width < 5 || height < 5) return null;
 
-    // Render full page
     const fullCanvas = document.createElement("canvas");
     fullCanvas.width = viewport.width;
     fullCanvas.height = viewport.height;
     const ctx = fullCanvas.getContext("2d")!;
     await page.render({ canvasContext: ctx, viewport }).promise;
 
-    // Crop to region
     const cropCanvas = document.createElement("canvas");
     cropCanvas.width = Math.max(Math.ceil(width), 1);
     cropCanvas.height = Math.max(Math.ceil(height), 1);
     const cropCtx = cropCanvas.getContext("2d")!;
 
-    // White background
     cropCtx.fillStyle = "#ffffff";
     cropCtx.fillRect(0, 0, cropCanvas.width, cropCanvas.height);
 
@@ -267,88 +381,6 @@ async function renderPageRegion(
       height
     );
 
-    return cropCanvas;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Render a region and preprocess for OCR: extract annotation-colored pixels
- * as dark text on white background, to help Tesseract read colored ink on
- * any background (dark, light, patterned).
- */
-async function renderRegionForOCR(
-  page: any,
-  cluster: AnnotationCluster,
-  scale: number = 3.0
-): Promise<HTMLCanvasElement | null> {
-  try {
-    const viewport = page.getViewport({ scale });
-    const pageHeight = page.getViewport({ scale: 1 }).height;
-
-    const pad = 8; // extra PDF-unit padding around cluster
-    const canvasLeft = Math.max(0, (cluster.minX - pad) * scale);
-    const canvasTop = Math.max(0, (pageHeight - cluster.maxY - pad) * scale);
-    const width = (cluster.maxX - cluster.minX + pad * 2) * scale;
-    const height = (cluster.maxY - cluster.minY + pad * 2) * scale;
-
-    if (width < 10 || height < 10) return null;
-
-    // Render full page
-    const fullCanvas = document.createElement("canvas");
-    fullCanvas.width = viewport.width;
-    fullCanvas.height = viewport.height;
-    const ctx = fullCanvas.getContext("2d")!;
-    await page.render({ canvasContext: ctx, viewport }).promise;
-
-    // Crop to cluster region
-    const cropW = Math.max(Math.ceil(width), 1);
-    const cropH = Math.max(Math.ceil(height), 1);
-    const cropCanvas = document.createElement("canvas");
-    cropCanvas.width = cropW;
-    cropCanvas.height = cropH;
-    const cropCtx = cropCanvas.getContext("2d")!;
-
-    cropCtx.drawImage(
-      fullCanvas,
-      canvasLeft,
-      canvasTop,
-      width,
-      height,
-      0,
-      0,
-      cropW,
-      cropH
-    );
-
-    // ── Preprocess: extract annotation-colored pixels as dark on white ──
-    const imageData = cropCtx.getImageData(0, 0, cropW, cropH);
-    const { data } = imageData;
-
-    for (let i = 0; i < data.length; i += 4) {
-      const r = data[i],
-        g = data[i + 1],
-        b = data[i + 2];
-
-      if (pixelMatchesColor(r, g, b, cluster.colorName)) {
-        // Annotation pixel → make it dark (for OCR readability)
-        const lum = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
-        const dark = Math.min(lum, 60); // clamp to dark
-        data[i] = dark;
-        data[i + 1] = dark;
-        data[i + 2] = dark;
-        data[i + 3] = 255;
-      } else {
-        // Non-annotation pixel → white background
-        data[i] = 255;
-        data[i + 1] = 255;
-        data[i + 2] = 255;
-        data[i + 3] = 255;
-      }
-    }
-
-    cropCtx.putImageData(imageData, 0, 0);
     return cropCanvas;
   } catch {
     return null;
@@ -373,137 +405,8 @@ async function ocrImage(
   }
 }
 
-// ─── Flattened-ink detection via content stream ─────────────
+// ─── Content-stream analysis for flattened annotations ──────
 
-/**
- * Scan the PDF page's content stream for colored path strokes that look
- * like handwritten annotations (red, green, blue, orange ink).
- * Returns clustered annotation regions ready for OCR.
- */
-async function detectFlattenedAnnotations(
-  page: any,
-  pageNum: number,
-  onProgress: ProgressCallback,
-  pct: number
-): Promise<Annotation[]> {
-  const ops = await page.getOperatorList();
-  const OPS = pdfjsLib.OPS;
-
-  // Track graphics state
-  let strokeColor: number[] = [0, 0, 0];
-  let fillColor: number[] = [0, 0, 0];
-  let lastPathCoords: number[] | null = null;
-
-  const strokes: StrokeBounds[] = [];
-
-  for (let i = 0; i < ops.fnArray.length; i++) {
-    const op = ops.fnArray[i];
-    const args = ops.argsArray[i];
-
-    switch (op) {
-      case OPS.setStrokeRGBColor:
-        strokeColor = [args[0], args[1], args[2]];
-        break;
-      case OPS.setFillRGBColor:
-        fillColor = [args[0], args[1], args[2]];
-        break;
-      case OPS.constructPath:
-        lastPathCoords = args[1]; // interleaved [x,y,x,y,...] coordinates
-        break;
-      case OPS.stroke:
-        if (lastPathCoords && lastPathCoords.length >= 4) {
-          const cls = classifyAnnotationColor(
-            strokeColor[0],
-            strokeColor[1],
-            strokeColor[2]
-          );
-          if (cls) {
-            const bounds = computeBoundsFromCoords(lastPathCoords);
-            if (bounds) strokes.push({ ...bounds, color: cls });
-          }
-        }
-        lastPathCoords = null;
-        break;
-      case OPS.fill:
-      case OPS.eoFill:
-        // Also check fills (some annotation tools fill shapes)
-        if (lastPathCoords && lastPathCoords.length >= 4) {
-          const cls = classifyAnnotationColor(
-            fillColor[0],
-            fillColor[1],
-            fillColor[2]
-          );
-          if (cls) {
-            const bounds = computeBoundsFromCoords(lastPathCoords);
-            if (bounds) strokes.push({ ...bounds, color: cls });
-          }
-        }
-        lastPathCoords = null;
-        break;
-      default:
-        break;
-    }
-  }
-
-  if (strokes.length === 0) return [];
-
-  onProgress(
-    `Found ${strokes.length} ink strokes on page ${pageNum} — clustering...`,
-    pct
-  );
-
-  // Cluster strokes into annotation regions
-  const clusters = clusterStrokes(strokes);
-
-  if (clusters.length === 0) return [];
-
-  onProgress(
-    `Page ${pageNum}: ${clusters.length} annotation region(s) — running OCR...`,
-    pct
-  );
-
-  // OCR each cluster
-  const annotations: Annotation[] = [];
-
-  // We'll render the page once at high res and reuse it
-  for (let ci = 0; ci < clusters.length; ci++) {
-    const cluster = clusters[ci];
-
-    const ocrCanvas = await renderRegionForOCR(page, cluster, 3.0);
-    let ocrText = "";
-    let confidence = 0;
-
-    if (ocrCanvas) {
-      // Only OCR clusters large enough to contain text
-      const clusterWidth = cluster.maxX - cluster.minX;
-      const clusterHeight = cluster.maxY - cluster.minY;
-
-      if (clusterWidth > 15 && clusterHeight > 8) {
-        const ocrResult = await ocrImage(ocrCanvas);
-        ocrText = ocrResult.text;
-        confidence = ocrResult.confidence;
-      }
-    }
-
-    // Determine annotation type label from color
-    const typeLabel = `Ink — ${cluster.colorName} (Embedded)`;
-
-    annotations.push({
-      pageNumber: pageNum,
-      type: typeLabel,
-      content: "",
-      author: "",
-      color: cluster.colorHex,
-      ocrText,
-      confidence,
-      rect: [cluster.minX, cluster.minY, cluster.maxX, cluster.maxY],
-    });
-  }
-
-  return annotations;
-}
-
-/** Compute axis-aligned bounding box from interleaved [x,y,x,y,...] coords */
 function computeBoundsFromCoords(
   coords: number[]
 ): { minX: number; minY: number; maxX: number; maxY: number } | null {
@@ -528,13 +431,168 @@ function computeBoundsFromCoords(
   return { minX, minY, maxX, maxY };
 }
 
+/**
+ * Detect flattened ink annotations via content-stream analysis.
+ * Returns annotation objects with cropped images + OCR for text regions.
+ */
+async function detectFlattenedAnnotations(
+  page: any,
+  pageNum: number,
+  onProgress: ProgressCallback,
+  pct: number
+): Promise<Annotation[]> {
+  const ops = await page.getOperatorList();
+  const OPS = pdfjsLib.OPS;
+
+  let strokeColor: number[] = [0, 0, 0];
+  let fillColor: number[] = [0, 0, 0];
+  let lastPathCoords: number[] | null = null;
+
+  const strokes: StrokeBounds[] = [];
+
+  for (let i = 0; i < ops.fnArray.length; i++) {
+    const op = ops.fnArray[i];
+    const args = ops.argsArray[i];
+
+    switch (op) {
+      case OPS.setStrokeRGBColor:
+        strokeColor = [args[0], args[1], args[2]];
+        break;
+      case OPS.setFillRGBColor:
+        fillColor = [args[0], args[1], args[2]];
+        break;
+      case OPS.constructPath:
+        lastPathCoords = args[1];
+        break;
+      case OPS.stroke:
+        if (lastPathCoords && lastPathCoords.length >= 4) {
+          const cls = classifyAnnotationColor(
+            strokeColor[0],
+            strokeColor[1],
+            strokeColor[2]
+          );
+          if (cls) {
+            const bounds = computeBoundsFromCoords(lastPathCoords);
+            if (bounds) strokes.push({ ...bounds, color: cls });
+          }
+        }
+        lastPathCoords = null;
+        break;
+      case OPS.fill:
+      case OPS.eoFill:
+        if (lastPathCoords && lastPathCoords.length >= 4) {
+          const cls = classifyAnnotationColor(
+            fillColor[0],
+            fillColor[1],
+            fillColor[2]
+          );
+          if (cls) {
+            const bounds = computeBoundsFromCoords(lastPathCoords);
+            if (bounds) strokes.push({ ...bounds, color: cls });
+          }
+        }
+        lastPathCoords = null;
+        break;
+      default:
+        break;
+    }
+  }
+
+  if (strokes.length === 0) return [];
+
+  // Cluster strokes into annotation regions
+  const clusters = clusterStrokes(strokes, 20);
+  if (clusters.length === 0) return [];
+
+  onProgress(
+    `Page ${pageNum}: ${clusters.length} annotation(s) found — rendering...`,
+    pct
+  );
+
+  // Render page once at 2x for visual crops
+  const renderScale = 2.0;
+  const pageHeightPdf = page.getViewport({ scale: 1 }).height;
+  const fullCanvas = await renderFullPage(page, renderScale);
+
+  // Also render at 3x for OCR (only if we have text-like regions)
+  const hasTextRegion = clusters.some(
+    (c) => classifyShape(c) === "text"
+  );
+  let ocrCanvas: HTMLCanvasElement | null = null;
+  if (hasTextRegion) {
+    ocrCanvas = await renderFullPage(page, 3.0);
+  }
+
+  const annotations: Annotation[] = [];
+
+  for (let ci = 0; ci < clusters.length; ci++) {
+    const cluster = clusters[ci];
+    const shape = classifyShape(cluster);
+
+    // Crop the visual image from 2x render
+    const visualCrop = cropRegion(
+      fullCanvas,
+      cluster,
+      pageHeightPdf,
+      renderScale,
+      10
+    );
+    const imageDataUrl = visualCrop ? canvasToDataUrl(visualCrop) : "";
+
+    let ocrText = "";
+    let confidence = 0;
+
+    // Only OCR text-like regions (skip marks, circles, lines)
+    if (shape === "text" && ocrCanvas) {
+      const ocrCrop = cropRegion(ocrCanvas, cluster, pageHeightPdf, 3.0, 8);
+      if (ocrCrop) {
+        const processed = preprocessForOCR(ocrCrop, cluster.colorName);
+        const result = await ocrImage(processed);
+        ocrText = result.text;
+        confidence = result.confidence;
+      }
+    }
+
+    // Build a readable type label
+    let typeLabel = "";
+    switch (shape) {
+      case "text":
+        typeLabel = `Handwritten Note (${cluster.colorName})`;
+        break;
+      case "mark":
+        typeLabel = `Mark / Checkmark (${cluster.colorName})`;
+        break;
+      case "circle":
+        typeLabel = `Circle / Shape (${cluster.colorName})`;
+        break;
+      case "line":
+        typeLabel = `Line / Arrow (${cluster.colorName})`;
+        break;
+    }
+
+    annotations.push({
+      pageNumber: pageNum,
+      type: typeLabel,
+      content: "",
+      author: "",
+      color: cluster.colorHex,
+      ocrText,
+      confidence,
+      rect: [cluster.minX, cluster.minY, cluster.maxX, cluster.maxY],
+      imageDataUrl,
+      shape,
+    });
+  }
+
+  return annotations;
+}
+
 // ─── Main Extraction Function ───────────────────────────────
 
 export async function extractAnnotations(
   file: File,
   onProgress: ProgressCallback
 ): Promise<ExtractionResult> {
-  // Initialize pdf.js worker
   if (typeof window !== "undefined") {
     pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.worker.min.mjs`;
   }
@@ -557,14 +615,12 @@ export async function extractAnnotations(
 
     const page = await pdf.getPage(pageNum);
 
-    // ── 1. Try standard annotation objects first ──
+    // ── 1. Standard annotation objects ──
     const pageAnnotations = await page.getAnnotations();
     let standardCount = 0;
 
     for (const annot of pageAnnotations) {
       const typeNum = annot.annotationType;
-
-      // Skip popups and widgets (form fields)
       if (typeNum === 16 || typeNum === 20) continue;
 
       standardCount++;
@@ -577,7 +633,6 @@ export async function extractAnnotations(
       let ocrText = "";
       let confidence = 0;
 
-      // For ink (handwritten) annotations, render & OCR
       if (typeNum === 15 && rect) {
         onProgress(`OCR on ink annotation (page ${pageNum})...`, pct);
         const canvas = await renderPageRegion(page, rect);
@@ -588,7 +643,6 @@ export async function extractAnnotations(
         }
       }
 
-      // For FreeText without embedded content, OCR the region
       if (typeNum === 3 && !content.trim() && rect) {
         const canvas = await renderPageRegion(page, rect);
         if (canvas) {
@@ -607,10 +661,12 @@ export async function extractAnnotations(
         ocrText,
         confidence,
         rect,
+        imageDataUrl: "",
+        shape: typeNum === 15 ? "text" : "",
       });
     }
 
-    // ── 2. Fallback: detect flattened/embedded annotations ──
+    // ── 2. Fallback: flattened/embedded annotations ──
     if (standardCount === 0) {
       const flatAnnotations = await detectFlattenedAnnotations(
         page,
@@ -742,7 +798,7 @@ export function formatAsMarkdown(result: ExtractionResult): string {
         }
 
         if (!hasContent) {
-          lines.push("*(No text content extracted)*");
+          lines.push("*(Visual annotation — see image)*");
           lines.push("");
         }
 
