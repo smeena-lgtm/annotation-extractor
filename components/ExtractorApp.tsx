@@ -364,10 +364,12 @@ export default function ExtractorApp() {
                   value: result.annotations.filter((a) => a.type.includes("Ink")).length,
                 },
                 {
-                  label: "Notes & Comments",
-                  value: result.annotations.filter(
-                    (a) => a.type.includes("Sticky") || a.type.includes("FreeText")
-                  ).length,
+                  label: result.usedVisualDetection ? "Detection" : "Notes & Comments",
+                  value: result.usedVisualDetection
+                    ? "Visual"
+                    : result.annotations.filter(
+                        (a) => a.type.includes("Sticky") || a.type.includes("FreeText")
+                      ).length,
                 },
               ].map((stat) => (
                 <div
@@ -502,12 +504,11 @@ export default function ExtractorApp() {
             }}>
               {[
                 "Ink (pen / stylus handwriting)",
+                "Flattened / embedded ink (iPad, GoodNotes, etc.)",
                 "FreeText (typed annotations)",
                 "Sticky Notes / Comments",
-                "Highlights",
-                "Underlines",
-                "Strikeouts",
-                "Stamps & Shapes",
+                "Highlights & Underlines",
+                "Strikeouts & Stamps",
               ].map((item) => (
                 <div key={item} style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   <span style={{ color: "var(--green)", fontSize: 10 }}>●</span> {item}
